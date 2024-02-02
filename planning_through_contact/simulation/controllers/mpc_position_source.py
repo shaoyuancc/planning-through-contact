@@ -21,6 +21,7 @@ from planning_through_contact.simulation.planar_pushing.pusher_pose_controller i
 from planning_through_contact.simulation.systems.contact_detection_system import (
     ContactDetectionSystem,
 )
+from planning_through_contact.simulation.systems.discrete_integrator import DiscreteIntegrator
 
 
 class MPCPositionSource(DesiredPlanarPositionSourceBase):
@@ -60,10 +61,16 @@ class MPCPositionSource(DesiredPlanarPositionSourceBase):
             ),
         )
 
+        self._discrete_integrator = builder.AddNamedSystem(
+            "DiscreteIntegrator",
+            DiscreteIntegrator(2)
+        )
+
         # MPC controller
         self._pusher_pose_controller = builder.AddNamedSystem(
             "PusherPoseController",
             PusherPoseController(
+                integrator = self._discrete_integrator,
                 dynamics_config=self._sim_config.dynamics_config,
                 mpc_config=self._sim_config.mpc_config,
                 closed_loop=self._sim_config.closed_loop,
@@ -77,6 +84,8 @@ class MPCPositionSource(DesiredPlanarPositionSourceBase):
             ZeroOrderHold(period, vector_size=2),  # Just the x and y positions
         )
 
+        
+
         ## Internal connections
 
         builder.Connect(
@@ -87,6 +96,10 @@ class MPCPositionSource(DesiredPlanarPositionSourceBase):
         builder.Connect(
             self._pusher_pose_controller.GetOutputPort("translation"),
             self._zero_order_hold.get_input_port(),
+        )
+        builder.Connect(
+            self._zero_order_hold.get_output_port(),
+            self._discrete_integrator.get_input_port(),
         )
 
         builder.Connect(
@@ -122,8 +135,11 @@ class MPCPositionSource(DesiredPlanarPositionSourceBase):
             "pusher_pose_estimated",
         )
 
+        # builder.ExportOutput(
+        #     self._zero_order_hold.get_output_port(), "planar_position_command"
+        # )
         builder.ExportOutput(
-            self._zero_order_hold.get_output_port(), "planar_position_command"
+            self._discrete_integrator.get_output_port(), "planar_position_command"
         )
 
         # Reference trajectory for pusher

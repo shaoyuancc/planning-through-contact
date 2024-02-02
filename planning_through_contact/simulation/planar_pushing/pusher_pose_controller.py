@@ -47,6 +47,7 @@ class PusherPoseControllerState(Enum):
 class PusherPoseController(LeafSystem):
     def __init__(
         self,
+        integrator,
         dynamics_config: SliderPusherSystemConfig,
         mpc_config: HybridMpcConfig,
         closed_loop: bool = True,
@@ -56,6 +57,7 @@ class PusherPoseController(LeafSystem):
         self.dynamics_config = dynamics_config
         self.mpc_config = mpc_config
         self.closed_loop = closed_loop
+        self._integrator = integrator
 
         self._clamped_last_step = False
         self._last_hybrid_mpc_time = 0
@@ -250,12 +252,12 @@ class PusherPoseController(LeafSystem):
             x_curr, x_traj[:N], u_traj[: N - 1]
         )
 
-        next_pusher_pose = PlanarPose(*(pusher_pose_acc.pos() + h * pusher_vel), 0)
-        pusher_pose_cmd_state.set_value(next_pusher_pose)
+        # next_pusher_pose = PlanarPose(*(pusher_pose_acc.pos() + h * pusher_vel), 0)
+        # pusher_pose_cmd_state.set_value(next_pusher_pose)
         mpc_control_state.set_value(u_input)
         mpc_control_desired_state.set_value(u_traj[0])
 
-        return next_pusher_pose
+        return pusher_vel # next_pusher_pose
 
     def _call_return_to_contact_controller(
         self,
@@ -292,14 +294,18 @@ class PusherPoseController(LeafSystem):
             pusher_pose_cmd_state = context.get_mutable_abstract_state(
                 self.pusher_pose_cmd_index
             )
+            self._integrator.set_integral_value(pusher_planar_pose.pos().flatten())
 
         if state == PusherPoseControllerState.CFREE_MPC:
-            curr_planar_pose = pusher_planar_pose_traj[0]
-            output.set_value(curr_planar_pose.pos())
+            # curr_planar_pose = pusher_planar_pose_traj[0]
+            # output.set_value(curr_planar_pose.pos())
+            pusher_vel = (pusher_planar_pose_traj[0].pos() - pusher_planar_pose.pos()) * (1/self.mpc_config.step_size)
+            # print(f"pusher_vel: {pusher_vel.flatten()}")
+            output.set_value(pusher_vel.flatten())
             mpc_control_state.SetFromVector([0, 0, 0])
             mpc_control_desired_state.SetFromVector([0, 0, 0])
 
-        elif state == PusherPoseControllerState.HYBRID_MPC:
+        elif state == PusherPoseControllerState.HYBRID_MPC or state == PusherPoseControllerState.RETURN_TO_CONTACT:
             mode_traj: List[PlanarPushingContactMode] = self.contact_mode_traj.Eval(context)  # type: ignore
             slider_planar_pose_traj: List[PlanarPose] = self.slider_planar_pose_traj.Eval(context)  # type: ignore
             contact_force_traj: List[npt.NDArray[np.float64]] = self.contact_force_traj.Eval(context)  # type: ignore
@@ -308,7 +314,7 @@ class PusherPoseController(LeafSystem):
                 pusher_pose_cmd_state.set_value(pusher_planar_pose)
             self._hybrid_mpc_count += 1
 
-            next_pusher_pose = self._call_mpc(
+            pusher_vel = self._call_mpc(
                 slider_planar_pose,
                 pusher_planar_pose,
                 slider_planar_pose_traj,
@@ -319,8 +325,7 @@ class PusherPoseController(LeafSystem):
                 mpc_control_state=mpc_control_state,
                 mpc_control_desired_state=mpc_control_desired_state,
             )
-
-            output.set_value(next_pusher_pose.pos())
+            output.set_value(pusher_vel)
 
         elif state == PusherPoseControllerState.RETURN_TO_CONTACT:
             mode_traj: List[PlanarPushingContactMode] = self.contact_mode_traj.Eval(context)  # type: ignore

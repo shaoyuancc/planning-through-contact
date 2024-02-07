@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Tuple
 
+from multiprocessing import Pool
+
 import numpy as np
 import numpy.typing as npt
 import pydrake.symbolic as sym
@@ -23,6 +25,7 @@ from planning_through_contact.planning.planar.planar_plan_config import (
     SliderPusherSystemConfig,
 )
 from planning_through_contact.tools.types import NpVariableArray
+from planning_through_contact.tools.utils import evaluate_np_expressions_array
 
 # Set the print precision to 4 decimal places
 np.set_printoptions(precision=4, suppress=True)
@@ -192,6 +195,8 @@ class HybridMpc:
         x_traj: List[npt.NDArray[np.float64]],
         u_traj: List[npt.NDArray[np.float64]],
         mode: HybridModes,
+        As,
+        Bs,
     ) -> Tuple[MathematicalProgram, NpVariableArray, NpVariableArray]:
         N = len(x_traj)
         h = self.config.step_size
@@ -231,6 +236,83 @@ class HybridMpc:
         x_bar_curr = x_curr - x_traj[0]
         prog.AddLinearConstraint(eq(x_bar[:, 0], x_bar_curr))
 
+        # # Dynamic constraints
+        # lin_systems = [
+        #     self._get_linear_system(state, control)
+        #     for state, control in zip(x_traj, u_traj)
+        # ][
+        #     : N - 1
+        # ]  # we only have N-1 controls
+
+        # As = [sys.A() for sys in lin_systems]
+        # Bs = [sys.B() for sys in lin_systems]
+        for i, (A, B) in enumerate(zip(As, Bs)):
+            x_bar_dot = A.dot(x_bar[:, i]) + B.dot(u_bar[:, i])
+            forward_euler = x_bar[:, i] + h * x_bar_dot
+            prog.AddLinearConstraint(eq(x_bar[:, i + 1], forward_euler))
+
+        # # Last error state should be exactly 0
+        # if self.config.enforce_hard_end_constraint:
+        #     prog.AddLinearConstraint(eq(x_bar[:, N - 1], np.zeros(x_traj[-1].shape)))
+
+        # # x_bar = x - x_traj
+        # x = x_bar + np.vstack(x_traj).T
+
+        # if len(u_traj) == N:  # make sure u_traj is not too long
+        #     u_traj = u_traj[: N - 1]
+        # # u_bar = u - u_traj
+        # u = u_bar + np.vstack(u_traj).T
+
+        # # Control constraints
+        # mu = self.dynamics_config.friction_coeff_slider_pusher
+        # # Control limits:
+        # lb = np.array(
+        #     [0, -self.config.u_max_magnitude[1], -self.config.u_max_magnitude[2]]
+        # )
+        # ub = self.config.u_max_magnitude
+        # for i, u_i in enumerate(u.T):
+        #     c_n = u_i[0]
+        #     c_f = u_i[1]
+        #     lam_dot = u_i[2]
+
+        #     prog.AddLinearConstraint(c_n >= 0)
+
+        #     if mode == HybridModes.STICKING or i > num_sliding_steps:
+        #         prog.AddLinearConstraint(c_f <= mu * c_n)
+        #         prog.AddLinearConstraint(c_f >= -mu * c_n)
+        #         prog.AddLinearEqualityConstraint(lam_dot == 0)
+
+        #     elif mode == HybridModes.SLIDING_LEFT:
+        #         prog.AddLinearConstraint(c_f == mu * c_n)
+        #         prog.AddLinearConstraint(lam_dot <= 0)
+
+        #     else:  # SLIDING_RIGHT
+        #         prog.AddLinearConstraint(c_f == -mu * c_n)
+        #         prog.AddLinearConstraint(lam_dot >= 0)
+
+        #     # Control Limits:
+        #     prog.AddLinearConstraint(c_n <= ub[0])
+        #     prog.AddLinearConstraint(c_f >= lb[1])
+        #     prog.AddLinearConstraint(c_f <= ub[1])
+        #     prog.AddLinearConstraint(lam_dot >= lb[2])
+        #     prog.AddLinearConstraint(lam_dot <= ub[2])
+
+        # # State constraints
+        # for state in x.T:
+        #     lam = state[3]
+        #     prog.AddLinearConstraint(lam >= self.config.lam_min)
+        #     prog.AddLinearConstraint(lam <= self.config.lam_max)
+
+        # if self._last_sols[mode] is not None:
+        #     # Warm start
+        #     prog.SetInitialGuess(x_bar, self._last_sols[mode]["x_bar"])
+        #     prog.SetInitialGuess(u_bar, self._last_sols[mode]["u_bar"])
+
+        return prog, x, u  # type: ignore
+
+
+    def compute_control_in_parallel(self, x_curr, x_traj, u_traj):
+        N = len(x_traj)
         # Dynamic constraints
         lin_systems = [
             self._get_linear_system(state, control)
@@ -241,69 +323,9 @@ class HybridMpc:
 
         As = [sys.A() for sys in lin_systems]
         Bs = [sys.B() for sys in lin_systems]
-        for i, (A, B) in enumerate(zip(As, Bs)):
-            x_bar_dot = A.dot(x_bar[:, i]) + B.dot(u_bar[:, i])
-            forward_euler = x_bar[:, i] + h * x_bar_dot
-            prog.AddLinearConstraint(eq(x_bar[:, i + 1], forward_euler))
-
-        # Last error state should be exactly 0
-        if self.config.enforce_hard_end_constraint:
-            prog.AddLinearConstraint(eq(x_bar[:, N - 1], np.zeros(x_traj[-1].shape)))
-
-        # x_bar = x - x_traj
-        x = x_bar + np.vstack(x_traj).T
-
-        if len(u_traj) == N:  # make sure u_traj is not too long
-            u_traj = u_traj[: N - 1]
-        # u_bar = u - u_traj
-        u = u_bar + np.vstack(u_traj).T
-
-        # Control constraints
-        mu = self.dynamics_config.friction_coeff_slider_pusher
-        # Control limits:
-        lb = np.array(
-            [0, -self.config.u_max_magnitude[1], -self.config.u_max_magnitude[2]]
-        )
-        ub = self.config.u_max_magnitude
-        for i, u_i in enumerate(u.T):
-            c_n = u_i[0]
-            c_f = u_i[1]
-            lam_dot = u_i[2]
-
-            prog.AddLinearConstraint(c_n >= 0)
-
-            if mode == HybridModes.STICKING or i > num_sliding_steps:
-                prog.AddLinearConstraint(c_f <= mu * c_n)
-                prog.AddLinearConstraint(c_f >= -mu * c_n)
-                prog.AddLinearEqualityConstraint(lam_dot == 0)
-
-            elif mode == HybridModes.SLIDING_LEFT:
-                prog.AddLinearConstraint(c_f == mu * c_n)
-                prog.AddLinearConstraint(lam_dot <= 0)
-
-            else:  # SLIDING_RIGHT
-                prog.AddLinearConstraint(c_f == -mu * c_n)
-                prog.AddLinearConstraint(lam_dot >= 0)
-
-            # Control Limits:
-            prog.AddLinearConstraint(c_n <= ub[0])
-            prog.AddLinearConstraint(c_f >= lb[1])
-            prog.AddLinearConstraint(c_f <= ub[1])
-            prog.AddLinearConstraint(lam_dot >= lb[2])
-            prog.AddLinearConstraint(lam_dot <= ub[2])
-
-        # State constraints
-        for state in x.T:
-            lam = state[3]
-            prog.AddLinearConstraint(lam >= self.config.lam_min)
-            prog.AddLinearConstraint(lam <= self.config.lam_max)
-
-        if self._last_sols[mode] is not None:
-            # Warm start
-            prog.SetInitialGuess(x_bar, self._last_sols[mode]["x_bar"])
-            prog.SetInitialGuess(u_bar, self._last_sols[mode]["u_bar"])
-
-        return prog, x, u  # type: ignore
+        with Pool() as pool:
+            results = pool.map(solve_for_mode, [(x_curr, x_traj, u_traj, mode, self.config, self.dynamics_config, As, Bs) for mode in HybridModes])
+        return results
 
     def compute_control(
         self,
@@ -312,36 +334,38 @@ class HybridMpc:
         u_traj: List[npt.NDArray[np.float64]],
     ) -> Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
         # Solve one prog per contact mode
-        progs, states, controls = zip(
-            *[self._setup_QP(x_curr, x_traj, u_traj, mode) for mode in HybridModes]
-        )
-        results = [Solve(prog) for prog in progs]  # type: ignore
+        #rogs, states, controls = zip(
+        #    *[self._setup_QP(x_curr, x_traj, u_traj, mode) for mode in HybridModes]
+        #)
+        #results = [Solve(prog) for prog in progs]  # type: ignore
+        #modes = HybridModes
+        costs, states, controls = zip(*self.compute_control_in_parallel(x_curr, x_traj, u_traj))
 
         # Log solve times for debugging
         # for mode, result in zip(HybridModes, results):
         #     self._solve_time_log[mode].append(result.get_solver_details().optimizer_time)
 
         # Save solutions to warmstart the next iteration
-        for mode, result in zip(HybridModes, results):
-            if result.is_success():
-                self._last_sols[mode] = {
-                    "x_bar": result.GetSolution(self._vars[mode]["x_bar"]),
-                    "u_bar": result.GetSolution(self._vars[mode]["u_bar"]),
-                }
-            else:
-                self._last_sols[mode] = None
+        # for mode, result in zip(HybridModes, results):
+        #     if result.is_success():
+        #         self._last_sols[mode] = {
+        #             "x_bar": result.GetSolution(self._vars[mode]["x_bar"]),
+        #             "u_bar": result.GetSolution(self._vars[mode]["u_bar"]),
+        #         }
+        #     else:
+        #         self._last_sols[mode] = None
 
-        costs = [
-            result.get_optimal_cost() if result.is_success() else np.inf
-            for result in results
-        ]  # we do not allow infeasible results
+        # costs = [
+        #     result.get_optimal_cost() if result.is_success() else np.inf
+        #     for result in results
+        # ]  # we do not allow infeasible results
         best_idx = np.argmin(costs)
         state = states[best_idx]
         control = controls[best_idx]
-        result = results[best_idx]
         lowest_cost = costs[best_idx]
 
-        state_sol = sym.Evaluate(result.GetSolution(state))  # type: ignore
+        #state_sol = sym.Evaluate(result.GetSolution(state))  # type: ignore
+        state_sol = state
 
         x_next = state_sol[:, 1]
 
@@ -349,7 +373,8 @@ class HybridMpc:
         # Uses the linear approximation of the dynamics
         x_dot_curr = (x_next - x_curr) / self.config.step_size
 
-        control_sol = sym.Evaluate(result.GetSolution(control))  # type: ignore
+        #control_sol = sym.Evaluate(result.GetSolution(control))  # type: ignore
+        control_sol = control
 
         # self.cost_log.append(lowest_cost)
         # self.control_log.append(control_sol.T)
@@ -419,3 +444,129 @@ class HybridModelPredictiveControlSystem(LeafSystem):
 
     def get_desired_control_port(self) -> InputPort:
         return self.desired_control_port
+
+def setup_QP_prog(
+        x_curr: npt.NDArray[np.float64],
+        x_traj: List[npt.NDArray[np.float64]],
+        u_traj: List[npt.NDArray[np.float64]],
+        mode: HybridModes,
+        config,
+        dynamics_config,
+        As,
+        Bs,
+    ) -> Tuple[MathematicalProgram, NpVariableArray, NpVariableArray]:
+        N = len(x_traj)
+        h = config.step_size
+        num_sliding_steps = config.num_sliding_steps
+
+        # Reuse mathematical program
+        #prog = self._progs[mode]
+        #x_bar = self._vars[mode]["x_bar"]
+        #u_bar = self._vars[mode]["u_bar"]
+
+        # Clear all previous constraints
+        #all_constraints = prog.GetAllConstraints()
+        #for constraint in all_constraints:
+        #    prog.RemoveConstraint(constraint)
+
+        # DONT REUSE MATHEMATICAL PROGRAM
+        prog = MathematicalProgram()
+
+        # Formulate the problem in the local coordinates around the nominal trajectory
+        x_bar = prog.NewContinuousVariables(4, N, "x_bar")
+        u_bar = prog.NewContinuousVariables(3, N - 1, "u_bar")
+        Q = config.Q
+        R = config.R
+        Q_N = config.Q_N
+        # Cost
+        state_running_cost = sum(
+            [x_bar[:, i].T.dot(Q).dot(x_bar[:, i]) for i in range(N - 1)]
+        )
+        input_running_cost = sum(
+            [u_bar[:, i].T.dot(R).dot(u_bar[:, i]) for i in range(N - 1)]
+        )
+        terminal_cost = x_bar[:, N - 1].T.dot(Q_N).dot(x_bar[:, N - 1])
+        prog.AddCost(terminal_cost + state_running_cost + input_running_cost)
+        # DONT REUSE MATHEMATICAL PROGRAM
+
+        # Initial value constraint
+        x_bar_curr = x_curr - x_traj[0]
+        prog.AddLinearConstraint(eq(x_bar[:, 0], x_bar_curr))
+
+        # # Dynamic constraints
+        # lin_systems = [
+        #     self._get_linear_system(state, coresults
+        # ]  # we only have N-1 controls
+
+        # As = [sys.A() for sys in lin_systems]
+        # Bs = [sys.B() for sys in lin_systems]
+        for i, (A, B) in enumerate(zip(As, Bs)):
+            x_bar_dot = A.dot(x_bar[:, i]) + B.dot(u_bar[:, i])
+            forward_euler = x_bar[:, i] + h * x_bar_dot
+            prog.AddLinearConstraint(eq(x_bar[:, i + 1], forward_euler))
+
+        # # Last error state should be exactly 0
+        # if self.config.enforce_hard_end_constraint:
+        #     prog.AddLinearConstraint(eq(x_bar[:, N - 1], np.zeros(x_traj[-1].shape)))
+
+        # x_bar = x - x_traj
+        x = x_bar + np.vstack(x_traj).T
+
+        if len(u_traj) == N:  # make sure u_traj is not too long
+            u_traj = u_traj[: N - 1]
+        # u_bar = u - u_traj
+        u = u_bar + np.vstack(u_traj).T
+
+        # Control constraints
+        mu = dynamics_config.friction_coeff_slider_pusher
+        # Control limits:
+        lb = np.array(
+            [0, -config.u_max_magnitude[1], -config.u_max_magnitude[2]]
+        )
+        ub = config.u_max_magnitude
+        for i, u_i in enumerate(u.T):
+            c_n = u_i[0]
+            c_f = u_i[1]
+            lam_dot = u_i[2]
+
+            prog.AddLinearConstraint(c_n >= 0)
+
+            if mode == HybridModes.STICKING or i > num_sliding_steps:
+                prog.AddLinearConstraint(c_f <= mu * c_n)
+                prog.AddLinearConstraint(c_f >= -mu * c_n)
+                prog.AddLinearEqualityConstraint(lam_dot == 0)
+
+            elif mode == HybridModes.SLIDING_LEFT:
+                prog.AddLinearConstraint(c_f == mu * c_n)
+                prog.AddLinearConstraint(lam_dot <= 0)
+
+            else:  # SLIDING_RIGHT
+                prog.AddLinearConstraint(c_f == -mu * c_n)
+                prog.AddLinearConstraint(lam_dot >= 0)
+
+            # Control Limits:
+            prog.AddLinearConstraint(c_n <= ub[0])
+            prog.AddLinearConstraint(c_f >= lb[1])
+            prog.AddLinearConstraint(c_f <= ub[1])
+            prog.AddLinearConstraint(lam_dot >= lb[2])
+            prog.AddLinearConstraint(lam_dot <= ub[2])
+
+        # State constraints
+        for state in x.T:
+            lam = state[3]
+            prog.AddLinearConstraint(lam >= config.lam_min)
+            prog.AddLinearConstraint(lam <= config.lam_max)
+
+        # if self._last_sols[mode] is not None:
+        #     # Warm start
+        #     prog.SetInitialGuess(x_bar, ._last_sols[mode]["x_bar"])
+        #     prog.SetInitialGuess(u_bar, self._last_sols[mode]["u_bar"])
+
+        return prog, x, u  # type: ignore
+
+def solve_for_mode(args):
+    x_curr, x_traj, u_traj, mode, config, dynamics_config, As, Bs = args
+    
+    prog, states, controls = setup_QP_prog(x_curr, x_traj, u_traj, mode, config, dynamics_config, As, Bs)
+    result = Solve(prog)
+    return result.get_optimal_cost(), evaluate_np_expressions_array(states, result), evaluate_np_expressions_array(controls, result)
